@@ -192,6 +192,12 @@ src-tauri/
 
 ---
 
+## 🤝 Contributing
+
+Contributions, feature requests, and bug reports are welcome! Please check out our [CONTRIBUTING.md](file:///c:/Users/naim%20dev/Desktop/learning_tauri_rust/ai_desktop_assistant/CONTRIBUTING.md) guide for details on setting up your dev environment and submitting Pull Requests.
+
+---
+
 ## 📄 License
 
 MIT License — Feel free to use, modify, and extend for your own projects!
