@@ -46,6 +46,51 @@ body {
   margin: 0;
 }
 
+/* Engine Switcher Card */
+.engine-card {
+  background: rgba(15, 23, 42, 0.7);
+  padding: 1rem 1.2rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 1rem;
+}
+
+.engine-card h3 {
+  margin: 0 0 0.8rem 0;
+  font-size: 0.95rem;
+  color: #cbd5e1;
+}
+
+.engine-toggle-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.8rem;
+}
+
+.engine-btn {
+  background: rgba(30, 41, 59, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #94a3b8;
+  padding: 0.65rem 1rem;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.engine-btn:hover {
+  border-color: rgba(255, 255, 255, 0.3);
+  color: #f8fafc;
+}
+
+.engine-btn.active {
+  background: linear-gradient(135deg, #38bdf8 0%, #6366f1 100%);
+  color: white;
+  border-color: transparent;
+  box-shadow: 0 4px 12px rgba(56, 189, 248, 0.25);
+}
+
 /* API Key Form */
 .api-card {
   background: rgba(15, 23, 42, 0.7);

@@ -29,17 +29,25 @@ function App() {
   const [isKeySaved, setIsKeySaved] = useState<boolean>(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
 
+  const [sttEngine, setSttEngine] = useState<"groq" | "local">("groq");
+
   useEffect(() => {
     // 1. Fetch initial status
     invoke<boolean>("get_audio_status").then(setIsRecording);
 
-    // 2. Load saved Groq API key from localStorage
+    // 2. Load saved Groq API key & STT engine preference from localStorage
     const savedKey = localStorage.getItem("groq_api_key");
     if (savedKey) {
       setApiKey(savedKey);
       invoke("set_groq_api_key", { apiKey: savedKey })
         .then(() => setIsKeySaved(true))
         .catch(console.error);
+    }
+
+    const savedEngine = localStorage.getItem("stt_engine") as "groq" | "local" | null;
+    if (savedEngine) {
+      setSttEngine(savedEngine);
+      invoke("set_stt_engine", { engine: savedEngine }).catch(console.error);
     }
 
     // 3. Listen for audio-level events
@@ -75,6 +83,12 @@ function App() {
     setIsKeySaved(true);
   };
 
+  const handleEngineSwitch = async (engine: "groq" | "local") => {
+    setSttEngine(engine);
+    await invoke("set_stt_engine", { engine });
+    localStorage.setItem("stt_engine", engine);
+  };
+
   const toggleRecording = async () => {
     if (isRecording) {
       await invoke("stop_audio_capture");
@@ -91,30 +105,51 @@ function App() {
     <div className="dashboard">
       <header className="header">
         <h1>🎙️ AI Assistant Real-Time Transcriber</h1>
-        <p className="subtitle">Groq Whisper STT API + Local Speech Accumulator</p>
+        <p className="subtitle">Groq Whisper Cloud STT + Local Whisper Model Engine</p>
       </header>
 
-      {/* Groq API Key Input Form */}
-      <div className="api-card">
-        <form onSubmit={handleSaveApiKey} className="api-form">
-          <label htmlFor="api-key-input"><strong>🔑 Groq API Key:</strong></label>
-          <input
-            id="api-key-input"
-            type="password"
-            placeholder="Paste gsk_... key from console.groq.com"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-          />
-          <button type="submit" className="save-btn">
-            {isKeySaved ? "✓ Key Active" : "Set API Key"}
+      {/* Engine Switcher Mode Card */}
+      <div className="engine-card">
+        <h3>⚙️ Select Speech-to-Text Engine:</h3>
+        <div className="engine-toggle-buttons">
+          <button
+            className={`engine-btn ${sttEngine === "groq" ? "active" : ""}`}
+            onClick={() => handleEngineSwitch("groq")}
+          >
+            ⚡ Groq Cloud Whisper API (Ultra-Fast &lt;200ms)
           </button>
-        </form>
-        {!isKeySaved && (
-          <p className="hint">
-            💡 Get a free API key at <a href="https://console.groq.com" target="_blank" rel="noreferrer">console.groq.com</a> for ultra-fast (&lt;200ms) transcriptions!
-          </p>
-        )}
+          <button
+            className={`engine-btn ${sttEngine === "local" ? "active" : ""}`}
+            onClick={() => handleEngineSwitch("local")}
+          >
+            💻 Local Offline Whisper (ggml-base.en.bin 142MB)
+          </button>
+        </div>
       </div>
+
+      {/* Groq API Key Input Form (Only visible in Groq mode) */}
+      {sttEngine === "groq" && (
+        <div className="api-card">
+          <form onSubmit={handleSaveApiKey} className="api-form">
+            <label htmlFor="api-key-input"><strong>🔑 Groq API Key:</strong></label>
+            <input
+              id="api-key-input"
+              type="password"
+              placeholder="Paste gsk_... key from console.groq.com"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+            />
+            <button type="submit" className="save-btn">
+              {isKeySaved ? "✓ Key Active" : "Set API Key"}
+            </button>
+          </form>
+          {!isKeySaved && (
+            <p className="hint">
+              💡 Get a free API key at <a href="https://console.groq.com" target="_blank" rel="noreferrer">console.groq.com</a> for ultra-fast (&lt;200ms) transcriptions!
+            </p>
+          )}
+        </div>
+      )}
 
       <div className="status-card">
         <div className="status-info">

@@ -22,6 +22,7 @@ pub struct TranscriptionPayload {
 pub struct AppState {
     pub is_recording: Arc<AtomicBool>,
     pub groq_api_key: Arc<Mutex<String>>,
+    pub stt_engine: Arc<Mutex<String>>, // "groq" or "local"
 }
 
 #[tauri::command]
@@ -54,6 +55,14 @@ fn set_groq_api_key(api_key: String, state: tauri::State<'_, AppState>) -> Resul
     *key_lock = api_key.trim().to_string();
     println!("🔑 Groq API Key updated successfully");
     Ok("Groq API Key set".into())
+}
+
+#[tauri::command]
+fn set_stt_engine(engine: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let mut eng_lock = state.stt_engine.lock().map_err(|e| e.to_string())?;
+    *eng_lock = engine.trim().to_lowercase();
+    println!("⚙️ STT Engine set to: {}", eng_lock);
+    Ok(format!("STT Engine set to {}", eng_lock))
 }
 
 pub enum AudioSource {
@@ -256,6 +265,34 @@ pub fn resample_to_16k(mono_samples: &[f32], src_rate: u32) -> Vec<f32> {
 }
 
 pub fn create_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. Calculate Peak Amplitude & RMS Level
+    let mut raw_peak: f32 = 0.0;
+    let mut sum_squares: f32 = 0.0;
+    for &s in samples {
+        let abs_s = s.abs();
+        if abs_s > raw_peak {
+            raw_peak = abs_s;
+        }
+        sum_squares += s * s;
+    }
+    let rms = (sum_squares / samples.len() as f32).sqrt();
+
+    // 2. Calculate Automatic Gain Control (AGC) factor (target peak = 0.90, max boost = 20x)
+    let gain = if raw_peak > 0.0001 {
+        (0.90 / raw_peak).min(20.0)
+    } else {
+        1.0
+    };
+
+    println!(
+        "📊 [AUDIO AGC] Raw Peak: {:.4} | RMS: {:.4} | Auto-Gain: {:.1}x",
+        raw_peak, rms, gain
+    );
+
     let num_channels: u16 = 1;
     let bits_per_sample: u16 = 16;
     let byte_rate = sample_rate * (num_channels as u32) * (bits_per_sample as u32 / 8);
@@ -284,8 +321,10 @@ pub fn create_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_size.to_le_bytes());
 
+    // 3. Write PCM samples scaled by gain factor and clamped
     for &sample in samples {
-        let clamped = sample.clamp(-1.0, 1.0);
+        let boosted = sample * gain;
+        let clamped = boosted.clamp(-1.0, 1.0);
         let int_sample = (clamped * 32767.0) as i16;
         wav.extend_from_slice(&int_sample.to_le_bytes());
     }
@@ -325,17 +364,166 @@ pub fn transcribe_groq(wav_bytes: Vec<u8>, api_key: &str) -> Result<String, Stri
     }
 }
 
+pub fn get_local_model_path() -> Result<std::path::PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+
+    let candidates = [
+        cwd.join("models").join("ggml-base.en.bin"),
+        cwd.join("src-tauri").join("models").join("ggml-base.en.bin"),
+        cwd.join("ggml-base.en.bin"),
+    ];
+
+    for path in &candidates {
+        if path.exists() && std::fs::metadata(path).map(|m| m.len() > 100000).unwrap_or(false) {
+            return Ok(path.clone());
+        }
+    }
+
+    Err(format!(
+        "❌ Local model 'ggml-base.en.bin' not found. Please place 'ggml-base.en.bin' in 'models/' folder at {:?}",
+        cwd.join("models")
+    ))
+}
+
+pub fn get_whisper_cli_path() -> Result<std::path::PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+
+    let candidates = [
+        cwd.join("bin").join("whisper-cli.exe"),
+        cwd.join("bin").join("main.exe"),
+        cwd.join("src-tauri").join("bin").join("whisper-cli.exe"),
+        cwd.join("models").join("whisper-cli.exe"),
+        cwd.join("whisper-cli.exe"),
+    ];
+
+    for path in &candidates {
+        if path.exists() && std::fs::metadata(path).map(|m| m.len() > 100000).unwrap_or(false) {
+            return Ok(path.clone());
+        }
+    }
+
+    Err(format!(
+        "❌ Local Whisper CLI 'whisper-cli.exe' not found. Please place 'whisper-cli.exe' in 'bin/' folder at {:?}",
+        cwd.join("bin")
+    ))
+}
+
+static LOCAL_WHISPER_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn transcribe_local(wav_bytes: Vec<u8>) -> Result<String, String> {
+    // Only allow ONE whisper-cli process to run at a time to prevent RAM exhaustion
+    let _lock = match LOCAL_WHISPER_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err("Local Whisper engine busy processing previous chunk".into());
+        }
+    };
+
+    let model_path = get_local_model_path()?;
+    let cli_path = get_whisper_cli_path()?;
+
+    let temp_dir = std::env::temp_dir().join("ai_assistant_stt");
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // Generate unique timestamp filename to prevent race conditions
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_wav = temp_dir.join(format!("speech_input_{}.wav", nanos));
+    std::fs::write(&temp_wav, &wav_bytes).map_err(|e| e.to_string())?;
+
+    // Set current_dir to the folder containing whisper-cli.exe so it can find sibling DLLs
+    let cli_dir = cli_path.parent().unwrap_or(std::path::Path::new("."));
+
+    let output = std::process::Command::new(&cli_path)
+        .current_dir(cli_dir)
+        .arg("-m")
+        .arg(&model_path)
+        .arg("-f")
+        .arg(&temp_wav)
+        .arg("-l")
+        .arg("en")
+        .arg("-nt")
+        .arg("-otxt")
+        .output()
+        .map_err(|e| format!("Failed to execute local Whisper CLI: {}", e))?;
+
+    // Check generated txt files
+    let txt_path1 = temp_wav.with_extension("wav.txt");
+    let txt_path2 = temp_dir.join(format!("speech_input_{}.txt", nanos));
+
+    let mut text = String::new();
+    if txt_path1.exists() {
+        text = std::fs::read_to_string(&txt_path1).unwrap_or_default();
+        let _ = std::fs::remove_file(&txt_path1);
+    } else if txt_path2.exists() {
+        text = std::fs::read_to_string(&txt_path2).unwrap_or_default();
+        let _ = std::fs::remove_file(&txt_path2);
+    }
+
+    let _ = std::fs::remove_file(&temp_wav);
+
+    if !text.trim().is_empty() {
+        return Ok(text.trim().to_string());
+    }
+
+    // Fallback: Parse stdout & stderr for recognized speech (filtering system backend logs)
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let clean_lines: Vec<String> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(|line| line.trim())
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("whisper_")
+                && !line.starts_with("system_info:")
+                && !line.starts_with("main:")
+                && !line.starts_with("load_backend:")
+                && !line.starts_with("ggml_")
+                && !line.starts_with("read_audio_data:")
+                && !line.starts_with("alloc_tensor_range:")
+                && !line.contains("GGML_ASSERT")
+                && !line.contains("failed to allocate")
+        })
+        .map(|line| {
+            if line.starts_with('[') && line.contains("-->") && line.contains(']') {
+                if let Some(idx) = line.find(']') {
+                    line[idx + 1..].trim().to_string()
+                } else {
+                    line.to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    let combined = clean_lines.join(" ");
+    if !combined.trim().is_empty() {
+        Ok(combined.trim().to_string())
+    } else {
+        Err("Local Whisper returned no text".into())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let is_recording = Arc::new(AtomicBool::new(true));
     let is_recording_bg = is_recording.clone();
     let groq_api_key = Arc::new(Mutex::new(String::new()));
     let groq_api_key_bg = groq_api_key.clone();
+    let stt_engine = Arc::new(Mutex::new("groq".to_string()));
+    let stt_engine_bg = stt_engine.clone();
 
     tauri::Builder::default()
         .manage(AppState {
             is_recording: is_recording.clone(),
             groq_api_key: groq_api_key.clone(),
+            stt_engine: stt_engine.clone(),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -374,54 +562,102 @@ pub fn run() {
                         // Resample mono using ACTUAL packet sample rate to 16,000 Hz for Speech-to-Text
                         let samples_16k = resample_to_16k(&mono_samples, packet.sample_rate);
 
-                        // Voice Activity Detection (VAD) & Speech Accumulation
+                        // Natural Utterance Endpointing VAD (Voice Activity & Natural Pause Detection)
                         match packet.source {
                             AudioSource::Microphone => {
-                                if volume > 0.010 {
+                                let is_speech = volume > 0.0040; // Noise gate threshold to reject room fan/static hum
+
+                                if is_speech {
                                     mic_buffer.extend_from_slice(&samples_16k);
                                     mic_silence_counter = 0;
                                 } else if !mic_buffer.is_empty() {
+                                    mic_buffer.extend_from_slice(&samples_16k);
                                     mic_silence_counter += 1;
                                 }
 
-                                // Accumulate ~2.0-3.0s of speech (32,000 to 48,000 samples) or silence after 1.5s
-                                let is_chunk_ready = mic_buffer.len() >= 48000
-                                    || (mic_silence_counter >= 15 && mic_buffer.len() >= 24000);
+                                let current_engine_check = stt_engine_bg.lock().unwrap().clone();
+                                let (min_samples, max_samples, pause_endpoint_packets, cooldown_ms) = if current_engine_check == "local" {
+                                    (12000, 240000, 25, 300)   // Local: ~0.75s min, ~500ms pause endpointing, 15s max force-flush
+                                } else {
+                                    (16000, 240000, 30, 2500)  // Groq: ~1.0s min, ~600ms pause endpointing, 15s max force-flush
+                                };
 
-                                if is_chunk_ready {
-                                    // Check 3.0-second rate-limit cooldown before firing Groq request
-                                    if last_mic_stt_time.elapsed() >= std::time::Duration::from_millis(3000) {
+                                let is_utterance_complete = (mic_silence_counter >= pause_endpoint_packets && mic_buffer.len() >= min_samples)
+                                    || mic_buffer.len() >= max_samples;
+
+                                if is_utterance_complete {
+                                    if last_mic_stt_time.elapsed() >= std::time::Duration::from_millis(cooldown_ms) {
                                         last_mic_stt_time = std::time::Instant::now();
-                                        let speech_chunk = std::mem::take(&mut mic_buffer);
+                                        
+                                        let speech_chunk = mic_buffer.clone();
+                                        let overlap_start = mic_buffer.len().saturating_sub(8000);
+                                        mic_buffer = mic_buffer[overlap_start..].to_vec();
                                         mic_silence_counter = 0;
 
                                         let api_key = groq_api_key_bg.lock().unwrap().clone();
+                                        let current_engine = stt_engine_bg.lock().unwrap().clone();
                                         let app_handle_clone = handle.clone();
                                         let capture_time = std::time::Instant::now();
 
                                         thread::spawn(move || {
                                             let queue_wait_ms = capture_time.elapsed().as_millis();
-                                            let wav_bytes = create_wav_bytes(&speech_chunk, 16000);
+                                            
+                                            // Check raw RMS before AGC to reject pure room noise/static
+                                            let mut sum_sq = 0.0f32;
+                                            for &s in &speech_chunk {
+                                                sum_sq += s * s;
+                                            }
+                                            let raw_rms = (sum_sq / speech_chunk.len().max(1) as f32).sqrt();
 
-                                            // STAGE TEST: Save debug WAV to disk to inspect audio quality before API send
-                                            if let Ok(_) = std::fs::create_dir_all("debug_audio") {
-                                                let _ = std::fs::write("debug_audio/last_mic_speech.wav", &wav_bytes);
+                                            if raw_rms < 0.0025 {
+                                                // Pure background static; skip STT to prevent Whisper hallucinations
+                                                return;
                                             }
 
-                                            if !api_key.is_empty() {
+                                            let wav_bytes = create_wav_bytes(&speech_chunk, 16000);
+
+                                            let temp_dir = std::env::temp_dir().join("ai_assistant_debug");
+                                            if let Ok(_) = std::fs::create_dir_all(&temp_dir) {
+                                                let _ = std::fs::write(temp_dir.join("last_mic_speech.wav"), &wav_bytes);
+                                            }
+
+                                            let is_hallucination = |txt: &str| {
+                                                let t = txt.trim().to_lowercase();
+                                                t == "you" || t == "thanks." || t == "thank you." || t == "thanks for watching!" || t == "thanks for watching." || t == "subtitles by" || t == "bye." || t == "." || t.contains("amara.org")
+                                            };
+
+                                            if current_engine == "local" {
+                                                let start_time = std::time::Instant::now();
+                                                println!("💻 [LOCAL STT MIC] Transcribing complete sentence utterance...");
+                                                match transcribe_local(wav_bytes) {
+                                                    Ok(text) => {
+                                                        let total_latency = start_time.elapsed().as_millis();
+                                                        if text.len() > 2 && !is_hallucination(&text) {
+                                                            println!("🎤 [LOCAL MIC] ({}ms): {}", total_latency, text);
+                                                            let _ = app_handle_clone.emit(
+                                                                "transcription",
+                                                                TranscriptionPayload {
+                                                                    source: "microphone".into(),
+                                                                    text,
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        if !e.contains("busy") {
+                                                            eprintln!("❌ Local Mic STT Error: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            } else if !api_key.is_empty() {
                                                 let api_start = std::time::Instant::now();
                                                 match transcribe_groq(wav_bytes, &api_key) {
                                                     Ok(text) => {
                                                         let api_latency_ms = api_start.elapsed().as_millis();
                                                         let total_latency_ms = capture_time.elapsed().as_millis();
 
-                                                        println!(
-                                                            "⏱️ [LATENCY - MIC] Queue Wait: {}ms | Groq API: {}ms | Total: {}ms",
-                                                            queue_wait_ms, api_latency_ms, total_latency_ms
-                                                        );
-
-                                                        if text.len() > 2 && text != "you" && text != "Thanks." && text != "Thank you." {
-                                                            println!("🎤 Transcribed Mic: {}", text);
+                                                        if text.len() > 2 && !is_hallucination(&text) {
+                                                            println!("🎤 [GROQ MIC] Queue: {}ms | API: {}ms | Total: {}ms -> {}", queue_wait_ms, api_latency_ms, total_latency_ms, text);
                                                             let _ = app_handle_clone.emit(
                                                                 "transcription",
                                                                 TranscriptionPayload {
@@ -433,7 +669,7 @@ pub fn run() {
                                                     }
                                                     Err(e) => {
                                                         let user_msg = if e.contains("rate_limit_exceeded") {
-                                                            "⏳ Groq Free API Rate limit (20 RPM) reached. Waiting 3s...".to_string()
+                                                            "⏳ Groq Free API Rate limit (20 RPM) reached. Switch to Local Mode or wait 3s...".to_string()
                                                         } else {
                                                             format!("⚠️ {}", e)
                                                         };
@@ -452,61 +688,99 @@ pub fn run() {
                                                     "transcription",
                                                     TranscriptionPayload {
                                                         source: "microphone".into(),
-                                                        text: "[Speech Detected] Please enter your Groq API Key above to see transcriptions!".into(),
+                                                        text: "[Speech Detected] Please enter your Groq API Key or switch to Local Mode above!".into(),
                                                     },
                                                 );
                                             }
                                         });
                                     }
-                                } else if mic_silence_counter >= 20 {
+                                } else if mic_silence_counter >= 60 {
                                     mic_buffer.clear();
                                     mic_silence_counter = 0;
                                 }
                             }
                             AudioSource::Speaker => {
-                                if volume > 0.012 {
+                                let is_speech = volume > 0.0006; // Highly sensitive threshold for YouTube / system audio
+
+                                if is_speech {
                                     speaker_buffer.extend_from_slice(&samples_16k);
                                     speaker_silence_counter = 0;
                                 } else if !speaker_buffer.is_empty() {
+                                    speaker_buffer.extend_from_slice(&samples_16k);
                                     speaker_silence_counter += 1;
                                 }
 
-                                let is_chunk_ready = speaker_buffer.len() >= 48000
-                                    || (speaker_silence_counter >= 15 && speaker_buffer.len() >= 24000);
+                                let current_engine_check = stt_engine_bg.lock().unwrap().clone();
+                                let (min_samples, max_samples, pause_endpoint_packets, cooldown_ms) = if current_engine_check == "local" {
+                                    (12000, 240000, 25, 300)
+                                } else {
+                                    (16000, 240000, 30, 2500)
+                                };
 
-                                if is_chunk_ready {
-                                    if last_speaker_stt_time.elapsed() >= std::time::Duration::from_millis(3000) {
+                                let is_utterance_complete = (speaker_silence_counter >= pause_endpoint_packets && speaker_buffer.len() >= min_samples)
+                                    || speaker_buffer.len() >= max_samples;
+
+                                if is_utterance_complete {
+                                    if last_speaker_stt_time.elapsed() >= std::time::Duration::from_millis(cooldown_ms) {
                                         last_speaker_stt_time = std::time::Instant::now();
-                                        let speech_chunk = std::mem::take(&mut speaker_buffer);
+                                        
+                                        let speech_chunk = speaker_buffer.clone();
+                                        let overlap_start = speaker_buffer.len().saturating_sub(8000);
+                                        speaker_buffer = speaker_buffer[overlap_start..].to_vec();
                                         speaker_silence_counter = 0;
 
                                         let api_key = groq_api_key_bg.lock().unwrap().clone();
+                                        let current_engine = stt_engine_bg.lock().unwrap().clone();
                                         let app_handle_clone = handle.clone();
                                         let capture_time = std::time::Instant::now();
 
                                         thread::spawn(move || {
                                             let queue_wait_ms = capture_time.elapsed().as_millis();
+
+                                            let is_hallucination = |txt: &str| {
+                                                let t = txt.trim().to_lowercase();
+                                                t == "you" || t == "thanks." || t == "thank you." || t == "thanks for watching!" || t == "thanks for watching." || t == "subtitles by" || t == "bye." || t == "." || t.contains("amara.org")
+                                            };
+
                                             let wav_bytes = create_wav_bytes(&speech_chunk, 16000);
 
-                                            // STAGE TEST: Save debug WAV to disk for speaker loopback audio inspection
-                                            if let Ok(_) = std::fs::create_dir_all("debug_audio") {
-                                                let _ = std::fs::write("debug_audio/last_speaker_speech.wav", &wav_bytes);
+                                            let temp_dir = std::env::temp_dir().join("ai_assistant_debug");
+                                            if let Ok(_) = std::fs::create_dir_all(&temp_dir) {
+                                                let _ = std::fs::write(temp_dir.join("last_speaker_speech.wav"), &wav_bytes);
                                             }
 
-                                            if !api_key.is_empty() {
+                                            if current_engine == "local" {
+                                                let start_time = std::time::Instant::now();
+                                                println!("💻 [LOCAL STT SPEAKER] Transcribing complete speaker utterance...");
+                                                match transcribe_local(wav_bytes) {
+                                                    Ok(text) => {
+                                                        let total_latency = start_time.elapsed().as_millis();
+                                                        if text.len() > 2 && !is_hallucination(&text) {
+                                                            println!("🔊 [LOCAL SPEAKER] ({}ms): {}", total_latency, text);
+                                                            let _ = app_handle_clone.emit(
+                                                                "transcription",
+                                                                TranscriptionPayload {
+                                                                    source: "speaker".into(),
+                                                                    text,
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        if !e.contains("busy") {
+                                                            eprintln!("❌ Local Speaker STT Error: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            } else if !api_key.is_empty() {
                                                 let api_start = std::time::Instant::now();
                                                 match transcribe_groq(wav_bytes, &api_key) {
                                                     Ok(text) => {
                                                         let api_latency_ms = api_start.elapsed().as_millis();
                                                         let total_latency_ms = capture_time.elapsed().as_millis();
 
-                                                        println!(
-                                                            "⏱️ [LATENCY - SPEAKER] Queue Wait: {}ms | Groq API: {}ms | Total: {}ms",
-                                                            queue_wait_ms, api_latency_ms, total_latency_ms
-                                                        );
-
-                                                        if text.len() > 2 && text != "you" && text != "Thanks." {
-                                                            println!("🔊 Transcribed Speaker: {}", text);
+                                                        if text.len() > 2 && !is_hallucination(&text) {
+                                                            println!("🔊 [GROQ SPEAKER] Queue: {}ms | API: {}ms | Total: {}ms -> {}", queue_wait_ms, api_latency_ms, total_latency_ms, text);
                                                             let _ = app_handle_clone.emit(
                                                                 "transcription",
                                                                 TranscriptionPayload {
@@ -518,7 +792,7 @@ pub fn run() {
                                                     }
                                                     Err(e) => {
                                                         let user_msg = if e.contains("rate_limit_exceeded") {
-                                                            "⏳ Groq Free API Rate limit (20 RPM) reached. Waiting 3s...".to_string()
+                                                            "⏳ Groq Free API Rate limit (20 RPM) reached. Switch to Local Mode or wait 3s...".to_string()
                                                         } else {
                                                             format!("⚠️ {}", e)
                                                         };
@@ -535,7 +809,7 @@ pub fn run() {
                                             }
                                         });
                                     }
-                                } else if speaker_silence_counter >= 20 {
+                                } else if speaker_silence_counter >= 60 {
                                     speaker_buffer.clear();
                                     speaker_silence_counter = 0;
                                 }
@@ -570,9 +844,9 @@ pub fn run() {
             start_audio_capture,
             stop_audio_capture,
             get_audio_status,
-            set_groq_api_key
+            set_groq_api_key,
+            set_stt_engine
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
