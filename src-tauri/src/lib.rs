@@ -411,13 +411,8 @@ pub fn get_whisper_cli_path() -> Result<std::path::PathBuf, String> {
 static LOCAL_WHISPER_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn transcribe_local(wav_bytes: Vec<u8>) -> Result<String, String> {
-    // Only allow ONE whisper-cli process to run at a time to prevent RAM exhaustion
-    let _lock = match LOCAL_WHISPER_LOCK.try_lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return Err("Local Whisper engine busy processing previous chunk".into());
-        }
-    };
+    // Acquire mutex lock (queues requests serially so no audio chunks are dropped & RAM remains ~150MB)
+    let _lock = LOCAL_WHISPER_LOCK.lock().unwrap();
 
     let model_path = get_local_model_path()?;
     let cli_path = get_whisper_cli_path()?;
@@ -565,7 +560,7 @@ pub fn run() {
                         // Natural Utterance Endpointing VAD (Voice Activity & Natural Pause Detection)
                         match packet.source {
                             AudioSource::Microphone => {
-                                let is_speech = volume > 0.0040; // Noise gate threshold to reject room fan/static hum
+                                let is_speech = volume > 0.0018; // Sensitive threshold for normal & quiet microphone speech
 
                                 if is_speech {
                                     mic_buffer.extend_from_slice(&samples_16k);
@@ -599,6 +594,13 @@ pub fn run() {
                                         let app_handle_clone = handle.clone();
                                         let capture_time = std::time::Instant::now();
 
+                                        println!(
+                                            "🎙️ [MIC VAD] Utterance captured! Samples: {} (~{:.1}s) | Engine: {}",
+                                            speech_chunk.len(),
+                                            speech_chunk.len() as f32 / 16000.0,
+                                            current_engine
+                                        );
+
                                         thread::spawn(move || {
                                             let queue_wait_ms = capture_time.elapsed().as_millis();
                                             
@@ -609,8 +611,8 @@ pub fn run() {
                                             }
                                             let raw_rms = (sum_sq / speech_chunk.len().max(1) as f32).sqrt();
 
-                                            if raw_rms < 0.0025 {
-                                                // Pure background static; skip STT to prevent Whisper hallucinations
+                                            if raw_rms < 0.0012 {
+                                                println!("⚠️ [MIC VAD] Raw RMS {:.5} below noise gate 0.0012, skipping silent chunk", raw_rms);
                                                 return;
                                             }
 
@@ -628,12 +630,12 @@ pub fn run() {
 
                                             if current_engine == "local" {
                                                 let start_time = std::time::Instant::now();
-                                                println!("💻 [LOCAL STT MIC] Transcribing complete sentence utterance...");
+                                                println!("💻 [LOCAL STT MIC] Transcribing mic audio chunk ({} bytes)...", wav_bytes.len());
                                                 match transcribe_local(wav_bytes) {
                                                     Ok(text) => {
                                                         let total_latency = start_time.elapsed().as_millis();
+                                                        println!("🎤 [LOCAL MIC RESULT] ({}) ({}ms): '{}'", if is_hallucination(&text) { "FILTERED" } else { "ACCEPTED" }, total_latency, text);
                                                         if text.len() > 2 && !is_hallucination(&text) {
-                                                            println!("🎤 [LOCAL MIC] ({}ms): {}", total_latency, text);
                                                             let _ = app_handle_clone.emit(
                                                                 "transcription",
                                                                 TranscriptionPayload {
@@ -644,20 +646,19 @@ pub fn run() {
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        if !e.contains("busy") {
-                                                            eprintln!("❌ Local Mic STT Error: {}", e);
-                                                        }
+                                                        println!("❌ Local Mic STT Error: {}", e);
                                                     }
                                                 }
                                             } else if !api_key.is_empty() {
                                                 let api_start = std::time::Instant::now();
+                                                println!("☁️ [GROQ STT MIC] Transcribing mic audio chunk via Groq API...");
                                                 match transcribe_groq(wav_bytes, &api_key) {
                                                     Ok(text) => {
                                                         let api_latency_ms = api_start.elapsed().as_millis();
                                                         let total_latency_ms = capture_time.elapsed().as_millis();
+                                                        println!("🎤 [GROQ MIC RESULT] Queue: {}ms | API: {}ms | Total: {}ms -> '{}'", queue_wait_ms, api_latency_ms, total_latency_ms, text);
 
                                                         if text.len() > 2 && !is_hallucination(&text) {
-                                                            println!("🎤 [GROQ MIC] Queue: {}ms | API: {}ms | Total: {}ms -> {}", queue_wait_ms, api_latency_ms, total_latency_ms, text);
                                                             let _ = app_handle_clone.emit(
                                                                 "transcription",
                                                                 TranscriptionPayload {
@@ -684,6 +685,7 @@ pub fn run() {
                                                     }
                                                 }
                                             } else {
+                                                println!("⚠️ [MIC STT] Speech detected but Groq API key is empty and engine is 'groq'");
                                                 let _ = app_handle_clone.emit(
                                                     "transcription",
                                                     TranscriptionPayload {
@@ -735,44 +737,54 @@ pub fn run() {
                                         let capture_time = std::time::Instant::now();
 
                                         thread::spawn(move || {
-                                            let queue_wait_ms = capture_time.elapsed().as_millis();
+                                             let queue_wait_ms = capture_time.elapsed().as_millis();
 
-                                            let is_hallucination = |txt: &str| {
-                                                let t = txt.trim().to_lowercase();
-                                                t == "you" || t == "thanks." || t == "thank you." || t == "thanks for watching!" || t == "thanks for watching." || t == "subtitles by" || t == "bye." || t == "." || t.contains("amara.org")
-                                            };
+                                             // Check raw RMS before AGC to reject silence or empty overlap buffers
+                                             let mut sum_sq = 0.0f32;
+                                             for &s in &speech_chunk {
+                                                 sum_sq += s * s;
+                                             }
+                                             let raw_rms = (sum_sq / speech_chunk.len().max(1) as f32).sqrt();
 
-                                            let wav_bytes = create_wav_bytes(&speech_chunk, 16000);
+                                             if raw_rms < 0.0006 {
+                                                 // Pure silence / zero amplitude; skip STT to prevent hallucination & empty logs
+                                                 return;
+                                             }
 
-                                            let temp_dir = std::env::temp_dir().join("ai_assistant_debug");
-                                            if let Ok(_) = std::fs::create_dir_all(&temp_dir) {
-                                                let _ = std::fs::write(temp_dir.join("last_speaker_speech.wav"), &wav_bytes);
-                                            }
+                                             let is_hallucination = |txt: &str| {
+                                                 let t = txt.trim().to_lowercase();
+                                                 t == "you" || t == "thanks." || t == "thank you." || t == "thanks for watching!" || t == "thanks for watching." || t == "subtitles by" || t == "bye." || t == "." || t.contains("amara.org")
+                                             };
 
-                                            if current_engine == "local" {
-                                                let start_time = std::time::Instant::now();
-                                                println!("💻 [LOCAL STT SPEAKER] Transcribing complete speaker utterance...");
-                                                match transcribe_local(wav_bytes) {
-                                                    Ok(text) => {
-                                                        let total_latency = start_time.elapsed().as_millis();
-                                                        if text.len() > 2 && !is_hallucination(&text) {
-                                                            println!("🔊 [LOCAL SPEAKER] ({}ms): {}", total_latency, text);
-                                                            let _ = app_handle_clone.emit(
-                                                                "transcription",
-                                                                TranscriptionPayload {
-                                                                    source: "speaker".into(),
-                                                                    text,
-                                                                },
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        if !e.contains("busy") {
-                                                            eprintln!("❌ Local Speaker STT Error: {}", e);
-                                                        }
-                                                    }
-                                                }
-                                            } else if !api_key.is_empty() {
+                                             let wav_bytes = create_wav_bytes(&speech_chunk, 16000);
+
+                                             let temp_dir = std::env::temp_dir().join("ai_assistant_debug");
+                                             if let Ok(_) = std::fs::create_dir_all(&temp_dir) {
+                                                 let _ = std::fs::write(temp_dir.join("last_speaker_speech.wav"), &wav_bytes);
+                                             }
+
+                                             if current_engine == "local" {
+                                                 let start_time = std::time::Instant::now();
+                                                 println!("💻 [LOCAL STT SPEAKER] Transcribing speaker utterance ({} samples, {:.2}s)...", speech_chunk.len(), speech_chunk.len() as f32 / 16000.0);
+                                                 match transcribe_local(wav_bytes) {
+                                                     Ok(text) => {
+                                                         let total_latency = start_time.elapsed().as_millis();
+                                                         if text.len() > 2 && !is_hallucination(&text) {
+                                                             println!("🔊 [LOCAL SPEAKER] ({}ms): {}", total_latency, text);
+                                                             let _ = app_handle_clone.emit(
+                                                                 "transcription",
+                                                                 TranscriptionPayload {
+                                                                     source: "speaker".into(),
+                                                                     text,
+                                                                 },
+                                                             );
+                                                         }
+                                                     }
+                                                     Err(e) => {
+                                                         eprintln!("❌ Local Speaker STT Error: {}", e);
+                                                     }
+                                                 }
+                                             } else if !api_key.is_empty() {
                                                 let api_start = std::time::Instant::now();
                                                 match transcribe_groq(wav_bytes, &api_key) {
                                                     Ok(text) => {
